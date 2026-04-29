@@ -1,0 +1,1067 @@
+
+
+import re
+import time
+import uuid
+import tempfile
+import subprocess
+import shutil
+import logging
+import traceback
+import telebot
+from telebot import types
+import requests
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("media-bot")
+
+TOKEN = os.environ.get("TIKTOK_BOT_TOKEN")
+if not TOKEN:
+    raise RuntimeError("TIKTOK_BOT_TOKEN environment variable is not set")
+
+bot = telebot.TeleBot(TOKEN)
+
+TELEGRAM_MAX_BYTES = 50 * 1024 * 1024
+URL_REGEX = re.compile(r"https?://\S+")
+
+PLATFORM_PATTERNS = [
+    ("TikTok", ("tiktok.com", "vt.tiktok.com")),
+    ("YouTube", ("youtube.com", "youtu.be", "m.youtube.com")),
+    ("Instagram", ("instagram.com",)),
+    ("Facebook", ("facebook.com", "fb.watch", "fb.com", "m.facebook.com")),
+    ("Twitter/X", ("twitter.com", "x.com", "mobile.twitter.com")),
+]
+
+
+def detect_platform(url):
+    low = url.lower()
+    for name, hosts in PLATFORM_PATTERNS:
+        if any(h in low for h in hosts):
+            return name
+    return None
+
+
+PENDING_URLS = {}
+PENDING_TTL_SECONDS = 60 * 30
+
+
+def remember_url(url, platform):
+    now = time.time()
+    expired = [k for k, (_, _, ts) in PENDING_URLS.items() if now - ts > PENDING_TTL_SECONDS]
+    for k in expired:
+        PENDING_URLS.pop(k, None)
+    key = uuid.uuid4().hex[:12]
+    PENDING_URLS[key] = (url, platform, now)
+    return key
+
+
+def pop_url(key):
+    item = PENDING_URLS.pop(key, None)
+    if not item:
+        return None, None
+    return item[0], item[1]
+
+
+# ---------- TikTok URL helpers ----------
+
+import threading
+
+TIKTOK_SHORT_HOSTS = ("vm.tiktok.com", "vt.tiktok.com")
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
+def unwrap_short_url(url):
+    """Follow vm/vt.tiktok.com redirects to the canonical URL. Best effort."""
+    if not url:
+        return url
+    low = url.lower()
+    if not any(h in low for h in TIKTOK_SHORT_HOSTS):
+        return url
+    try:
+        r = requests.get(
+            url, allow_redirects=True, timeout=10,
+            headers={"User-Agent": _BROWSER_UA},
+        )
+        return r.url or url
+    except Exception:
+        return url
+
+
+def clean_tiktok_url(url):
+    """Resolve short links, strip query/tracking params and trailing slashes."""
+    url = unwrap_short_url(url)
+    if "?" in url:
+        url = url.split("?", 1)[0]
+    if "#" in url:
+        url = url.split("#", 1)[0]
+    return url.rstrip("/")
+
+
+# ---------- TikTok via tikwm.com (with rate-limit throttle + retry) ----------
+
+_tikwm_lock = threading.Lock()
+_tikwm_last = [0.0]
+
+
+def _tikwm_throttle():
+    with _tikwm_lock:
+        wait = 1.05 - (time.time() - _tikwm_last[0])
+        if wait > 0:
+            time.sleep(wait)
+        _tikwm_last[0] = time.time()
+
+
+def fetch_tiktok_raw(url):
+    """Return the parsed tikwm JSON response (or {'_error': ...} on failure)."""
+    _tikwm_throttle()
+    try:
+        r = requests.get(
+            "https://www.tikwm.com/api/", params={"url": url}, timeout=15,
+            headers={"User-Agent": _BROWSER_UA},
+        )
+        try:
+            return r.json()
+        except Exception:
+            return {"_error": f"HTTP {r.status_code}: {r.text[:200]}"}
+    except Exception as e:
+        return {"_error": f"{type(e).__name__}: {e}"}
+
+
+def fetch_tiktok_data(url):
+    """Normalize tikwm response. Returns (data_dict, error_msg)."""
+    resp = fetch_tiktok_raw(url)
+    if "_error" in resp:
+        log.error("tikwm request failed for url=%s err=%s", url, resp["_error"])
+        return None, resp["_error"]
+    code = resp.get("code")
+    msg = (resp.get("msg") or "").strip()
+
+    # Retry once if we hit the free-tier rate limit
+    if code == -1 and "limit" in msg.lower():
+        log.info("tikwm rate-limited, retrying once after pause")
+        time.sleep(1.2)
+        resp = fetch_tiktok_raw(url)
+        if "_error" in resp:
+            return None, resp["_error"]
+        code = resp.get("code")
+        msg = (resp.get("msg") or "").strip()
+
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    log.info(
+        "tikwm url=%s code=%s msg=%s images=%d has_play=%s",
+        url, code, msg,
+        len(data.get("images") or []) if data else 0,
+        bool(data.get("play")) if data else False,
+    )
+    if code == 0:
+        return (data or {}), None
+    return None, msg or f"tikwm code={code}"
+
+
+def download_tiktok_no_wm(url):
+    data, _err = fetch_tiktok_data(url)
+    if data:
+        return data.get("play")
+    return None
+
+
+def yt_dlp_tiktok_video_fallback(url, dest_dir):
+    """yt-dlp fallback for TikTok /video/ URLs only. Raises on failure."""
+    import yt_dlp
+    outtmpl = os.path.join(dest_dir, "%(id)s.%(ext)s")
+    opts = {
+        "quiet": True, "no_warnings": True, "outtmpl": outtmpl,
+        "format": "best[filesize<48M]/best[filesize_approx<48M]/best",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+    return path, info
+
+
+def download_to_file(url, suffix):
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=64 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return path
+    except Exception:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+
+# ---------- Audio extraction ----------
+
+def extract_mp3_ffmpeg(video_path, mp3_path):
+    cmd = [
+        "ffmpeg", "-y", "-i", video_path,
+        "-vn", "-acodec", "libmp3lame", "-q:a", "2", mp3_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0 and os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+        return True, None
+    err = (result.stderr or "").strip().splitlines()[-5:]
+    return False, "ffmpeg: " + " | ".join(err) if err else f"ffmpeg exited with code {result.returncode}"
+
+
+def extract_mp3_moviepy(video_path, mp3_path):
+    try:
+        try:
+            from moviepy import VideoFileClip
+        except ImportError:
+            from moviepy.editor import VideoFileClip
+        clip = VideoFileClip(video_path)
+        try:
+            if clip.audio is None:
+                return False, "moviepy: no audio track in video"
+            clip.audio.write_audiofile(mp3_path, logger=None)
+        finally:
+            try:
+                clip.close()
+            except Exception:
+                pass
+        if os.path.exists(mp3_path) and os.path.getsize(mp3_path) > 0:
+            return True, None
+        return False, "moviepy: produced empty file"
+    except Exception as e:
+        log.exception("moviepy extraction failed")
+        return False, f"moviepy: {type(e).__name__}: {e}"
+
+
+def extract_mp3(video_path, mp3_path):
+    ok, err1 = extract_mp3_ffmpeg(video_path, mp3_path)
+    if ok:
+        return True, None
+    log.warning("ffmpeg extract failed, trying moviepy. err=%s", err1)
+    if os.path.exists(mp3_path):
+        try:
+            os.remove(mp3_path)
+        except OSError:
+            pass
+    ok, err2 = extract_mp3_moviepy(video_path, mp3_path)
+    if ok:
+        return True, None
+    return False, f"{err1} || {err2}"
+
+
+# ---------- yt-dlp helpers (YouTube, Instagram, Facebook, Twitter/X) ----------
+
+INSTAGRAM_COOKIES_FILE = "instagram_cookies.txt"
+TWITTER_COOKIES_FILE = "twitter_cookies.txt"
+
+
+def _twitter_cookies_path():
+    return TWITTER_COOKIES_FILE if os.path.exists(TWITTER_COOKIES_FILE) else None
+
+
+def _is_twitter(url):
+    low = (url or "").lower()
+    return any(h in low for h in ("twitter.com", "x.com", "mobile.twitter.com"))
+
+
+def _apply_twitter_cookies(opts, url):
+    if _is_twitter(url):
+        ck = _twitter_cookies_path()
+        if ck:
+            opts["cookiefile"] = ck
+    return opts
+
+
+INSTAGRAM_NEEDS_COOKIES_MSG = (
+    "⚠️ انستجرام محتاج تسجيل دخول. كلم المطور يضيف Cookies"
+)
+_IG_FAILURE_KEYWORDS = (
+    "login required",
+    "rate-limit",
+    "rate limit",
+    "requested content is not available",
+    "empty media response",
+    "cookies",
+)
+
+
+def _instagram_cookies_path():
+    return INSTAGRAM_COOKIES_FILE if os.path.exists(INSTAGRAM_COOKIES_FILE) else None
+
+
+INSTAGRAM_STRATEGIES = [
+    ("A:iPhone Safari + AJAX", {
+        "user_agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5_1 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.5 Mobile/15E148 Safari/604.1"
+        ),
+        "http_headers": {
+            "X-Instagram-AJAX": "1",
+            "X-IG-App-ID": "936619743392459",
+            "X-Requested-With": "XMLHttpRequest",
+            "Referer": "https://www.instagram.com/",
+        },
+        "extractor_args": {"instagram": {"api_version": ["v1"]}},
+    }),
+    ("B:Android Samsung", {
+        "user_agent": (
+            "Mozilla/5.0 (Linux; Android 13; SM-S901B) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Mobile Safari/537.36"
+        ),
+        "extractor_args": {"instagram": {"api_version": ["v1"]}},
+    }),
+    ("C:Windows Chrome + Referer", {
+        "user_agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "http_headers": {"Referer": "https://www.instagram.com/"},
+    }),
+    ("D:Cookies only (basic)", {}),
+]
+
+IG_ALL_FAILED_MSG = (
+    "❌ فشل كل المحاولات. IP سيرفر Replit محظور من انستجرام. "
+    "الحل الوحيد: بروكسي مدفوع"
+)
+
+_ig_winning_strategy = {"index": None, "name": None}
+
+
+def _ig_try_strategies(action_fn, url, base_opts):
+    """Try each Instagram strategy with retries. Cache the winner.
+    Per strategy: 1 attempt + 2 retries (3 total) with 2s sleep between attempts.
+    Returns the first successful result, or raises RuntimeError(IG_ALL_FAILED_MSG)."""
+    indices = list(range(len(INSTAGRAM_STRATEGIES)))
+    if _ig_winning_strategy["index"] is not None:
+        winner = _ig_winning_strategy["index"]
+        log.info(
+            "instagram: starting with cached winning strategy [%s]",
+            _ig_winning_strategy["name"],
+        )
+        indices = [winner] + [i for i in indices if i != winner]
+
+    last_err_text = ""
+    ck = _instagram_cookies_path()
+    for idx in indices:
+        name, strat_opts = INSTAGRAM_STRATEGIES[idx]
+        for attempt in range(1, 4):
+            opts = dict(base_opts)
+            opts.update(strat_opts)
+            if ck:
+                opts["cookiefile"] = ck
+            log.info(
+                "instagram: trying strategy [%s] attempt %d/3 for %s",
+                name, attempt, url,
+            )
+            try:
+                result = action_fn(opts)
+                log.info("instagram: SUCCESS with strategy [%s]", name)
+                _ig_winning_strategy["index"] = idx
+                _ig_winning_strategy["name"] = name
+                return result
+            except Exception as e:
+                last_err_text = str(e).replace("\n", " ")[:160]
+                log.warning(
+                    "instagram: [%s] attempt %d/3 failed: %s",
+                    name, attempt, last_err_text,
+                )
+                if attempt < 3:
+                    time.sleep(2)
+    raise RuntimeError(f"{IG_ALL_FAILED_MSG} (last error: {last_err_text})")
+
+
+def _is_instagram(url):
+    return "instagram.com" in (url or "").lower()
+
+
+def _instagram_cookie_status():
+    """Return (path, sessionid_present, cookie_count). path is None if file missing."""
+    path = _instagram_cookies_path()
+    if not path:
+        return None, False, 0
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            data_lines = [ln for ln in f if ln.strip() and not ln.lstrip().startswith("#")]
+        names = []
+        for ln in data_lines:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) >= 7:
+                names.append(parts[5])
+        return path, ("sessionid" in names), len(data_lines)
+    except Exception as e:
+        log.warning("could not parse cookie file %s: %s", path, e)
+        return path, False, 0
+
+
+def log_cookie_status_at_startup():
+    path, has_session, count = _instagram_cookie_status()
+    if not path:
+        log.info("instagram cookies: NO FILE at %s — IG will use friendly error", INSTAGRAM_COOKIES_FILE)
+        return
+    log.info(
+        "instagram cookies: loaded %s (%d cookies, sessionid=%s)",
+        path, count, "yes" if has_session else "NO",
+    )
+
+
+def instagram_friendly_error(platform, exc):
+    """Translate raw yt-dlp Instagram errors into a clear Arabic message."""
+    if platform != "Instagram":
+        return None
+    text = str(exc).lower()
+    path, has_session, _count = _instagram_cookie_status()
+
+    # No cookies file uploaded at all
+    if not path:
+        if any(k in text for k in _IG_FAILURE_KEYWORDS):
+            return INSTAGRAM_NEEDS_COOKIES_MSG
+        return None
+
+    # Cookies file is present but malformed (no sessionid)
+    if not has_session and any(k in text for k in _IG_FAILURE_KEYWORDS):
+        return (
+            "⚠️ ملف الكوكيز ناقص (مفيش sessionid). "
+            "صدّر الكوكيز تاني وانت Logged-in في انستجرام"
+        )
+
+    # If our strategy loop already produced a final Arabic message, surface it as-is
+    if str(exc).startswith("❌ فشل كل المحاولات"):
+        return str(exc)
+    # Cookies are valid but Instagram still refuses (datacenter IP block / expired session)
+    if "empty media response" in text or "rate-limit" in text or "rate limit" in text:
+        return (
+            "⚠️ انستجرام رفض الرد رغم وجود الكوكيز. "
+            "غالباً الـ IP بتاع السيرفر متحظور من انستجرام، أو الجلسة انتهت. "
+            "جرّب تصدير كوكيز جديدة من جلسة ماسكة دلوقتي"
+        )
+    return None
+
+
+def yt_dlp_extract_info(url):
+    import yt_dlp
+    base_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": False,
+    }
+    if _is_instagram(url):
+        def _action(opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+        return _ig_try_strategies(_action, url, base_opts)
+    _apply_twitter_cookies(base_opts, url)
+    with yt_dlp.YoutubeDL(base_opts) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def yt_dlp_download_video(url, dest_dir):
+    import yt_dlp
+    outtmpl = os.path.join(dest_dir, "%(id)s.%(ext)s")
+    base_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": outtmpl,
+        "format": "best[filesize<48M]/best[filesize_approx<48M]/bv*[filesize<40M]+ba/b",
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+    }
+    if _is_instagram(url):
+        def _action(opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                return info, ydl.prepare_filename(info)
+        info, path = _ig_try_strategies(_action, url, base_opts)
+        return path, info
+    _apply_twitter_cookies(base_opts, url)
+    with yt_dlp.YoutubeDL(base_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+    return path, info
+
+
+def yt_dlp_download_audio(url, dest_dir):
+    import yt_dlp
+    outtmpl = os.path.join(dest_dir, "%(id)s.%(ext)s")
+    base_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": outtmpl,
+        "format": "bestaudio/best",
+        "noplaylist": True,
+        "postprocessors": [{
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": "192",
+        }],
+    }
+    if _is_instagram(url):
+        def _action(opts):
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                base, _ = os.path.splitext(ydl.prepare_filename(info))
+                return info, base + ".mp3"
+        info, mp3_path = _ig_try_strategies(_action, url, base_opts)
+        return mp3_path, info
+    _apply_twitter_cookies(base_opts, url)
+    with yt_dlp.YoutubeDL(base_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+        base, _ = os.path.splitext(path)
+        mp3_path = base + ".mp3"
+    return mp3_path, info
+
+
+def collect_image_urls_from_info(info):
+    """Return a list of image URLs if the info represents an image post / carousel, else None."""
+    if not info:
+        return None
+
+    def entry_image_url(e):
+        ext = (e.get("ext") or "").lower()
+        if ext in ("jpg", "jpeg", "png", "webp"):
+            url = e.get("url")
+            if url:
+                return url
+            for f in (e.get("formats") or []):
+                if (f.get("ext") or "").lower() in ("jpg", "jpeg", "png", "webp") and f.get("url"):
+                    return f["url"]
+        return None
+
+    if info.get("_type") in ("playlist", "multi_video"):
+        entries = info.get("entries") or []
+        urls = []
+        for e in entries:
+            if not e:
+                continue
+            u = entry_image_url(e)
+            if not u:
+                return None
+            urls.append(u)
+        return urls or None
+
+    u = entry_image_url(info)
+    if u:
+        return [u]
+    return None
+
+
+# ---------- Helpers ----------
+
+def safe_filename(name, fallback="audio"):
+    if not name:
+        return fallback
+    cleaned = re.sub(r"[^\w\-. ]+", "", name).strip()
+    cleaned = cleaned[:60].strip()
+    return cleaned or fallback
+
+
+def build_choice_keyboard(key):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🎬 فيديو", callback_data=f"v:{key}"),
+        types.InlineKeyboardButton("🎵 صوت MP3", callback_data=f"a:{key}"),
+    )
+    return kb
+
+
+def safe_edit_text(chat_id, message_id, text):
+    try:
+        bot.edit_message_text(text, chat_id, message_id)
+    except Exception:
+        pass
+
+
+def truncate(text, n=350):
+    if not text:
+        return ""
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def send_image_album(chat_id, urls, caption=None):
+    if not urls:
+        return
+    sent_caption = False
+    for i in range(0, len(urls), 10):
+        chunk = urls[i:i + 10]
+        media = []
+        for u in chunk:
+            if not sent_caption and caption:
+                media.append(types.InputMediaPhoto(u, caption=caption))
+                sent_caption = True
+            else:
+                media.append(types.InputMediaPhoto(u))
+        bot.send_media_group(chat_id, media)
+
+
+# ---------- Probing: figure out video vs images ----------
+
+def probe_content(url, platform):
+    """Returns (kind, image_urls, title). kind is 'video' or 'images'."""
+    if platform == "TikTok":
+        data, err = fetch_tiktok_data(url)
+        if data:
+            title = data.get("title") or ""
+            if data.get("images"):
+                return "images", list(data["images"]), title
+            if data.get("play"):
+                return "video", None, title
+        # tikwm gave nothing useful. Try yt-dlp fallback for /video/ URLs only.
+        log.warning("tikwm probe failed for url=%s err=%s; trying yt-dlp fallback", url, err)
+        if "/photo/" in url:
+            raise RuntimeError(err or "البوست ده مش متاح")
+        try:
+            info = yt_dlp_extract_info(url)
+            title = (info or {}).get("title") or ""
+            return "video", None, title
+        except Exception as ydl_err:
+            raise RuntimeError(f"{err or 'TikTok'} | yt-dlp: {ydl_err}")
+
+    info = yt_dlp_extract_info(url)
+    title = (info or {}).get("title") or ""
+    images = collect_image_urls_from_info(info)
+    if images:
+        return "images", images, title
+    return "video", None, title
+
+
+# ---------- Processors ----------
+
+def process_video(chat_id, status_message_id, url, platform):
+    safe_edit_text(chat_id, status_message_id, f"🎯 منصة: {platform}\n⏳ جاري التحميل...")
+    try:
+        if platform == "TikTok":
+            video_url = download_tiktok_no_wm(url)
+            if video_url:
+                bot.send_video(chat_id, video_url, caption=f"🎯 {platform}")
+                try:
+                    bot.delete_message(chat_id, status_message_id)
+                except Exception:
+                    pass
+                return
+            # tikwm failed: fall back to yt-dlp for /video/ URLs
+            if "/photo/" in url:
+                safe_edit_text(
+                    chat_id, status_message_id,
+                    "❌ تيكتوك: البوست ده مش متاح",
+                )
+                return
+            log.warning("tikwm video failed for url=%s; trying yt-dlp fallback", url)
+            with tempfile.TemporaryDirectory() as tmpdir:
+                path, _info = yt_dlp_tiktok_video_fallback(url, tmpdir)
+                if not path or not os.path.exists(path):
+                    safe_edit_text(
+                        chat_id, status_message_id, "مقدرتش احمل الفيديو"
+                    )
+                    return
+                size = os.path.getsize(path)
+                if size > TELEGRAM_MAX_BYTES:
+                    safe_edit_text(
+                        chat_id, status_message_id, "الفيديو كبير. جرب 🎵 صوت بس"
+                    )
+                    return
+                with open(path, "rb") as f:
+                    bot.send_video(chat_id, f, caption=f"🎯 {platform}")
+                try:
+                    bot.delete_message(chat_id, status_message_id)
+                except Exception:
+                    pass
+            return
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path, info = yt_dlp_download_video(url, tmpdir)
+            if not path or not os.path.exists(path):
+                safe_edit_text(
+                    chat_id, status_message_id, "مقدرتش احمل الفيديو"
+                )
+                return
+            size = os.path.getsize(path)
+            log.info("downloaded video: %s (%d bytes)", path, size)
+            if size > TELEGRAM_MAX_BYTES:
+                safe_edit_text(
+                    chat_id, status_message_id, "الفيديو كبير. جرب 🎵 صوت بس"
+                )
+                return
+            with open(path, "rb") as f:
+                bot.send_video(chat_id, f, caption=f"🎯 {platform}")
+            try:
+                bot.delete_message(chat_id, status_message_id)
+            except Exception:
+                pass
+    except Exception as e:
+        log.exception("process_video failed for url=%s", url)
+        friendly = instagram_friendly_error(platform, e)
+        safe_edit_text(
+            chat_id,
+            status_message_id,
+            friendly or truncate(f"❌ خطأ في الفيديو:\n{type(e).__name__}: {e}"),
+        )
+
+
+def process_mp3(chat_id, status_message_id, url, platform):
+    safe_edit_text(chat_id, status_message_id, f"🎯 منصة: {platform}\n⏳ جاري التحميل...")
+
+    if platform == "TikTok":
+        video_path = None
+        mp3_path = None
+        try:
+            data, err = fetch_tiktok_data(url)
+            title = "audio"
+            if data and data.get("play"):
+                title = data.get("title") or "audio"
+                video_path = download_to_file(data["play"], ".mp4")
+            elif "/photo/" not in url:
+                # tikwm couldn't find an audio source; try yt-dlp fallback for /video/
+                log.warning("tikwm mp3 failed for url=%s err=%s; trying yt-dlp fallback", url, err)
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    try:
+                        path, info = yt_dlp_download_audio(url, tmpdir)
+                        title = (info or {}).get("title") or "audio"
+                        # Move out of the temp dir so it survives the with-block
+                        fd, dst = tempfile.mkstemp(suffix=".mp3")
+                        os.close(fd)
+                        shutil.copyfile(path, dst)
+                        mp3_path = dst
+                    except Exception as ydl_err:
+                        safe_edit_text(
+                            chat_id, status_message_id,
+                            truncate(f"❌ تيكتوك:\n{err or ''} | yt-dlp: {ydl_err}"),
+                        )
+                        return
+            else:
+                safe_edit_text(
+                    chat_id, status_message_id,
+                    truncate(f"❌ تيكتوك:\n{err or 'البوست ده مش متاح'}"),
+                )
+                return
+
+            if not video_path and not mp3_path:
+                safe_edit_text(
+                    chat_id, status_message_id, "مقدرتش احمل الفيديو"
+                )
+                return
+
+            if not mp3_path:
+                fd, mp3_path = tempfile.mkstemp(suffix=".mp3")
+                os.close(fd)
+                ok, err2 = extract_mp3(video_path, mp3_path)
+                if not ok:
+                    safe_edit_text(
+                        chat_id, status_message_id,
+                        truncate(f"❌ فشل استخراج الصوت:\n{err2}"),
+                    )
+                    return
+            if os.path.getsize(mp3_path) > TELEGRAM_MAX_BYTES:
+                safe_edit_text(
+                    chat_id, status_message_id,
+                    "الملف كبير جداً وتيليجرام مش هيقبله (أكبر من 50 ميجا)",
+                )
+                return
+            with open(mp3_path, "rb") as audio:
+                bot.send_audio(
+                    chat_id, audio,
+                    title=safe_filename(title), performer="TikTok",
+                )
+            try:
+                bot.delete_message(chat_id, status_message_id)
+            except Exception:
+                pass
+        except Exception as e:
+            log.error("process_mp3 (TikTok) failed for url=%s\n%s", url, traceback.format_exc())
+            safe_edit_text(
+                chat_id, status_message_id,
+                truncate(f"❌ خطأ:\n{type(e).__name__}: {e}"),
+            )
+        finally:
+            for p in (video_path, mp3_path):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except OSError:
+                        pass
+        return
+
+    # Other platforms: yt-dlp
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mp3_path, info = yt_dlp_download_audio(url, tmpdir)
+            if not os.path.exists(mp3_path) or os.path.getsize(mp3_path) == 0:
+                safe_edit_text(chat_id, status_message_id, "مقدرتش استخرج الصوت")
+                return
+            if os.path.getsize(mp3_path) > TELEGRAM_MAX_BYTES:
+                safe_edit_text(
+                    chat_id, status_message_id,
+                    "الملف كبير جداً وتيليجرام مش هيقبله (أكبر من 50 ميجا)",
+                )
+                return
+            title = info.get("title") or "audio"
+            with open(mp3_path, "rb") as audio:
+                bot.send_audio(
+                    chat_id, audio,
+                    title=safe_filename(title), performer=platform,
+                )
+            try:
+                bot.delete_message(chat_id, status_message_id)
+            except Exception:
+                pass
+    except Exception as e:
+        log.error("process_mp3 (%s) failed for url=%s\n%s", platform, url, traceback.format_exc())
+        friendly = instagram_friendly_error(platform, e)
+        safe_edit_text(
+            chat_id, status_message_id,
+            friendly or truncate(f"❌ خطأ:\n{type(e).__name__}: {e}"),
+        )
+
+
+def process_images(chat_id, status_message_id, image_urls, platform):
+    safe_edit_text(
+        chat_id, status_message_id,
+        f"🎯 منصة: {platform}\n🖼️ بحمل {len(image_urls)} صورة...",
+    )
+    try:
+        caption = f"🎯 منصة: {platform} | 📸 عدد الصور: {len(image_urls)}"
+        send_image_album(chat_id, image_urls, caption=caption)
+        try:
+            bot.delete_message(chat_id, status_message_id)
+        except Exception:
+            pass
+    except Exception as e:
+        log.exception("process_images failed")
+        safe_edit_text(
+            chat_id, status_message_id,
+            truncate(f"❌ فشل إرسال الصور:\n{type(e).__name__}: {e}"),
+        )
+
+
+# ---------- Handlers ----------
+
+@bot.message_handler(commands=["debug"])
+def handle_debug(message):
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+    match = URL_REGEX.search(arg)
+    url = match.group(0) if match else ""
+    if not url:
+        bot.reply_to(message, "Send like this:\n/debug TIKTOK_URL")
+        return
+
+    cleaned = clean_tiktok_url(url)
+    resp = fetch_tiktok_raw(cleaned)
+    err = resp.get("_error")
+    code = resp.get("code")
+    api_msg = resp.get("msg")
+    data = resp.get("data") if isinstance(resp.get("data"), dict) else {}
+    images = data.get("images") if isinstance(data, dict) else None
+    has_video = bool(data.get("play")) if isinstance(data, dict) else False
+    music = data.get("music") if isinstance(data, dict) else None
+
+    lines = [
+        "🔎 tikwm raw response:",
+        f"• input URL: {url}",
+        f"• cleaned URL: {cleaned}" if cleaned != url else None,
+        f"• HTTP/transport error: {err}" if err else f"• code: {code}",
+        f"• msg: {api_msg}" if api_msg and not err else None,
+        f"• data.images: {len(images) if images else 0}",
+        f"• data.video (play): {'yes' if has_video else 'no'}",
+        f"• data.music: {'yes' if music else 'no'}",
+    ]
+    if isinstance(data, dict) and data:
+        lines.append(f"• data keys: {', '.join(list(data.keys())[:15])}")
+    if images:
+        lines.append("• first image:")
+        lines.append(str(images[0])[:200])
+    body = "\n".join(l for l in lines if l)
+    bot.reply_to(message, truncate(body, 3500))
+
+
+INSTAGRAM_DISABLED_MSG = (
+    "❌ عذراً، تحميل فيديوهات انستجرام محظور حالياً\n\n"
+    "السبب: سيرفرات انستجرام عاملة حظر على كل سيرفرات التحميل بسبب الصيانة\n\n"
+    "✅ البديل: ابعتلي لينك من تيك توك أو يوتيوب أو فيسبوك وهحملهولك فوراً\n\n"
+    "هنرجع نشغل انستجرام أول ما المشكلة تتحل من عندهم"
+)
+
+
+@bot.message_handler(commands=["start"])
+def start(message):
+    bot.reply_to(
+        message,
+        "ابعتلي رابط من تيكتوك / يوتيوب / انستجرام / فيسبوك / تويتر\n"
+        "هتختار فيديو ولا MP3 من الأزرار 🎬🎵\n"
+        "لو الرابط صور (سلايدشو أو كاروسيل) هحملهم على طول 🖼️\n"
+        "اختصار: /mp3 ورابط للصوت بس\n\n"
+        "⚠️ تنبيه: تحميل فيديوهات انستجرام متوقف مؤقتاً بسبب صيانة في "
+        "سيرفرات انستجرام. نقدر نحمل من تيك توك ويوتيوب وفيسبوك عادي ✅"
+    )
+
+
+@bot.message_handler(commands=["mp3"])
+def handle_mp3_command(message):
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    match = URL_REGEX.search(arg)
+    url = match.group(0) if match else ""
+
+    if not url:
+        bot.reply_to(message, "Send like this: /mp3 URL")
+        return
+
+    platform = detect_platform(url)
+    if not platform:
+        bot.reply_to(message, "المنصة دي مش مدعومة")
+        return
+
+    if platform == "Instagram":
+        bot.reply_to(message, INSTAGRAM_DISABLED_MSG)
+        return
+
+    if platform == "TikTok":
+        url = clean_tiktok_url(url)
+
+    status = bot.reply_to(message, f"🎯 منصة: {platform}\n⏳ جاري التحميل...")
+    process_mp3(message.chat.id, status.message_id, url, platform)
+
+
+@bot.message_handler(func=lambda message: True)
+def handle_link(message):
+    text = (message.text or "").strip()
+    match = URL_REGEX.search(text)
+    url = match.group(0) if match else ""
+
+    if not url:
+        bot.reply_to(message, "ابعت رابط من تيكتوك / يوتيوب / انستجرام / فيسبوك / تويتر")
+        return
+
+    platform = detect_platform(url)
+    if not platform:
+        bot.reply_to(message, "المنصة دي مش مدعومة. جرب تيكتوك أو يوتيوب أو انستجرام أو فيسبوك أو تويتر")
+        return
+
+    if platform == "Instagram":
+        bot.reply_to(message, INSTAGRAM_DISABLED_MSG)
+        return
+
+    if platform == "TikTok":
+        url = clean_tiktok_url(url)
+
+    status = bot.reply_to(message, f"🎯 منصة: {platform}\n⏳ جاري التحقق...")
+
+    try:
+        kind, image_urls, _title = probe_content(url, platform)
+    except Exception as e:
+        log.exception("probe failed for url=%s", url)
+        friendly = instagram_friendly_error(platform, e)
+        safe_edit_text(
+            message.chat.id, status.message_id,
+            friendly or truncate(f"🎯 منصة: {platform}\n❌ خطأ:\n{type(e).__name__}: {e}"),
+        )
+        return
+
+    if kind == "images":
+        process_images(message.chat.id, status.message_id, image_urls, platform)
+        return
+
+    key = remember_url(url, platform)
+    safe_edit_text(
+        message.chat.id, status.message_id,
+        f"🎯 منصة: {platform}\nاختار تحب تحمله إزاي؟",
+    )
+    try:
+        bot.edit_message_reply_markup(
+            message.chat.id, status.message_id,
+            reply_markup=build_choice_keyboard(key),
+        )
+    except Exception:
+        pass
+
+
+@bot.callback_query_handler(func=lambda c: c.data and (c.data.startswith("v:") or c.data.startswith("a:")))
+def handle_choice(call):
+    try:
+        action, key = call.data.split(":", 1)
+    except ValueError:
+        bot.answer_callback_query(call.id, "خطأ في البيانات")
+        return
+
+    url, platform = pop_url(key)
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+
+    if not url:
+        try:
+            bot.edit_message_text(
+                "الرابط ده انتهت صلاحيته، ابعته تاني",
+                chat_id, message_id,
+            )
+        except Exception:
+            pass
+        bot.answer_callback_query(call.id)
+        return
+
+    bot.answer_callback_query(call.id, "Loading...")
+
+    try:
+        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+    except Exception:
+        pass
+
+    if action == "v":
+        process_video(chat_id, message_id, url, platform)
+    else:
+        process_mp3(chat_id, message_id, url, platform)
+
+
+def _update_ytdlp_at_startup():
+    """Force-update yt-dlp on boot. Failure is non-fatal (logged only)."""
+    try:
+        log.info("updating yt-dlp to latest version...")
+        result = subprocess.run(
+            ["pip", "install", "-U", "--quiet", "--disable-pip-version-check", "yt-dlp"],
+            capture_output=True, text=True, timeout=120,
+        )
+        if result.returncode == 0:
+            try:
+                import yt_dlp
+                log.info("yt-dlp updated OK (now at %s)", yt_dlp.version.__version__)
+            except Exception:
+                log.info("yt-dlp updated OK")
+        else:
+            log.warning(
+                "yt-dlp update failed (rc=%d): %s",
+                result.returncode,
+                (result.stderr or result.stdout or "").strip()[:300],
+            )
+    except Exception as e:
+        log.warning("yt-dlp update skipped: %s: %s", type(e).__name__, e)
+
+
+if __name__ == "__main__":
+    if not shutil.which("ffmpeg"):
+        print("WARNING: ffmpeg not found in PATH; audio extraction will fail", flush=True)
+    _update_ytdlp_at_startup()
+    log_cookie_status_at_startup()
+    print("بوت التحميل شغال (TikTok / YouTube / Instagram / Facebook / Twitter)...", flush=True)
+    while True:
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception:
+            print("النت فصل... هحاول تاني بعد 5 ثواني", flush=True)
+            time.sleep(5)
